@@ -1,0 +1,104 @@
+name: ingest-and-publish
+
+# Exécuté dans le dépôt PUBLIC Bidiche49/sentinelle-zero-data (runners standards gratuits).
+# Le code du pipeline vit dans le dépôt PRIVÉ Bidiche49/sentinelle-zero, cloné avec une
+# deploy key en LECTURE SEULE (secret CODE_DEPLOY_KEY). Aucune autre clé n'est nécessaire :
+# l'état (release « state ») et la publication (branche gh-pages) utilisent le GITHUB_TOKEN du job.
+# Source versionnée : sentinelle-zero/ci/data-repo/.github/workflows/ingest.yml
+
+on:
+  schedule:
+    # Heures UTC : 03h (après publication des index EDGAR ~22h ET), puis pendant la séance US.
+    - cron: "23 3,12,15,18,20,22 * * 1-5"
+    - cron: "23 12 * * 0,6"       # 1 fois par jour le week-end
+  workflow_dispatch:
+    inputs:
+      backfill_days:
+        description: "Jours d'index EDGAR à (re)parcourir (0 = incrémental)"
+        default: "0"
+
+concurrency:
+  group: ingest
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # release « state » + branche gh-pages de CE dépôt
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      SZ_USER_AGENT: "SentinelleZero/0.1 (personal research app; contact: nicolazicdev@gmail.com)"
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Récupérer le code du pipeline (dépôt privé, lecture seule)
+        env:
+          CODE_DEPLOY_KEY: ${{ secrets.CODE_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$CODE_DEPLOY_KEY" > ~/.ssh/code_key && chmod 600 ~/.ssh/code_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/code_key -o IdentitiesOnly=yes" \
+            git clone -q --depth 1 --branch develop git@github.com:Bidiche49/sentinelle-zero.git code
+          rm -f ~/.ssh/code_key
+          git -C code log -1 --format='code @ %h %s'
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: code/pipeline/uv.lock
+
+      - name: Restaurer l'état
+        run: |
+          mkdir -p state
+          if gh release view state -R "$REPO" >/dev/null 2>&1; then
+            gh release download state -R "$REPO" -p sz.sqlite.gz -D state --clobber || true
+            gh release download state -R "$REPO" -p cusip-cache.json -D state --clobber || true
+          else
+            gh release create state -R "$REPO" --title "Pipeline state" \
+              --notes "Base SQLite du pipeline (données publiques dérivées). Ne pas supprimer." --latest=false
+          fi
+          if [ -f state/sz.sqlite.gz ]; then gunzip -f state/sz.sqlite.gz; fi
+          ls -la state
+
+      # Référentiel des élus (CC0, ~15 Mo) : actions/cache conserve les dates de fichiers,
+      # dont dépend le TTL du loader (current 24 h, historique 30 j).
+      - name: Cache du référentiel des élus
+        uses: actions/cache@v4
+        with:
+          path: state/legislators
+          key: legislators-${{ github.run_id }}
+          restore-keys: legislators-
+
+      - name: Tests du pipeline
+        working-directory: code/pipeline
+        run: uv run --frozen pytest -q
+
+      - name: Ingestion
+        working-directory: code/pipeline
+        run: |
+          uv run --frozen python -m sz.run --state "$GITHUB_WORKSPACE/state/sz.sqlite" \
+            --out "$GITHUB_WORKSPACE/site" --backfill-days "${{ github.event.inputs.backfill_days || '0' }}"
+
+      - name: Sauvegarder l'état
+        if: always()
+        run: |
+          if [ -f state/sz.sqlite ]; then
+            gzip -kf state/sz.sqlite
+            gh release upload state -R "$REPO" state/sz.sqlite.gz --clobber
+          fi
+          if [ -f state/cusip-cache.json ]; then gh release upload state -R "$REPO" state/cusip-cache.json --clobber; fi
+
+      - name: Publier l'API statique (branche gh-pages)
+        run: |
+          test -f site/v1/meta.json
+          cd site
+          git init -q -b gh-pages
+          git config user.name "sentinelle-zero-bot"
+          git config user.email "sentinelle-zero-bot@users.noreply.github.com"
+          git add -A
+          git commit -q -m "data: $(date -u +%Y-%m-%dT%H:%MZ)"
+          # Commit orphelin unique : pas d'historique qui gonfle ; l'état complet vit dans la release « state ».
+          git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" gh-pages
